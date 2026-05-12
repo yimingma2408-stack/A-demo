@@ -1,3 +1,7 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -12,26 +16,30 @@ __pycache__/
 venv/
 env/
 
-# macOS
-.DS_Store
-
 # VS Code local settings
 .vscode/
 
-# Data files
+# Raw and processed data
 data/raw/*
-!data/raw/.gitkeep
-
 data/processed/*
+
+# Keep folder structure
+!data/raw/.gitkeep
 !data/processed/.gitkeep
 
-# Results and large outputs
-results/*
-!results/.gitkeep
-
+# Large outputs
+*.csv
 *.parquet
 *.pkl
 *.h5
+
+# Result outputs
+results/figures/*
+results/tables/*
+
+# Keep result folders
+!results/figures/.gitkeep
+!results/tables/.gitkeep
 
 # Logs
 *.log
