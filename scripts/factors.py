@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 
 def add_daily_return(
@@ -189,3 +190,97 @@ def add_trend_factor(
     df[f"trend_{short_window}_{long_window}d"] = ma_short / ma_long - 1
 
     return df
+
+
+def add_price_volume_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a basic but useful A-share daily factor set."""
+    df = add_daily_return(df)
+    df = add_forward_return(df, horizon=5)
+    df = add_forward_return(df, horizon=20)
+    df = add_reversal_factor(df, window=20)
+    df = add_momentum_factor(df, lookback=120, skip=20)
+    df = add_volatility_factor(df, window=20)
+    df = add_volatility_factor(df, window=60)
+    df = add_liquidity_factor(df, window=20)
+    df = add_turnover_factor(df, window=20)
+    df = add_trend_factor(df, short_window=20, long_window=120)
+
+    df = df.sort_values(["ticker", "date"]).copy()
+    close = df.groupby("ticker")["close"]
+    high = df.groupby("ticker")["high"]
+    low = df.groupby("ticker")["low"]
+    volume = df.groupby("ticker")["volume"]
+
+    df["amplitude_20d"] = (
+        high.rolling(20).max().reset_index(level=0, drop=True)
+        / low.rolling(20).min().reset_index(level=0, drop=True)
+        - 1
+    )
+    df["volume_ratio_20d"] = df["volume"] / volume.rolling(20).mean().reset_index(level=0, drop=True)
+    df["price_to_120d_high"] = close.transform(lambda s: s / s.rolling(120).max())
+    df["log_amount"] = np.log1p(df["amount"])
+    return df
+
+
+def get_default_factor_cols() -> list[str]:
+    """Return the default factor columns created by add_price_volume_factors."""
+    return [
+        "rev_20d",
+        "mom_120_20d",
+        "lowvol_20d",
+        "lowvol_60d",
+        "liq_20d",
+        "turnover_20d",
+        "trend_20_120d",
+        "amplitude_20d",
+        "volume_ratio_20d",
+        "price_to_120d_high",
+        "log_amount",
+    ]
+
+
+def winsorize_by_date(
+    df: pd.DataFrame,
+    cols: list[str],
+    lower: float = 0.01,
+    upper: float = 0.99,
+) -> pd.DataFrame:
+    """Clip factor outliers cross-sectionally by date."""
+    df = df.copy()
+    for col in cols:
+        bounds = df.groupby("date")[col].quantile([lower, upper]).unstack()
+        bounds.columns = ["lower", "upper"]
+        df = df.join(bounds, on="date")
+        df[col] = df[col].clip(df["lower"], df["upper"])
+        df = df.drop(columns=["lower", "upper"])
+    return df
+
+
+def zscore_by_date(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Cross-sectionally z-score factor columns by date."""
+    df = df.copy()
+    grouped = df.groupby("date")
+    for col in cols:
+        mean = grouped[col].transform("mean")
+        std = grouped[col].transform("std").replace(0, np.nan)
+        df[f"{col}_z"] = (df[col] - mean) / std
+    return df
+
+
+def build_factor_panel(
+    df: pd.DataFrame,
+    factor_cols: list[str] | None = None,
+    winsorize: bool = True,
+    zscore: bool = True,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Create factors, optional winsorization, and z-scored model inputs."""
+    panel = add_price_volume_factors(df)
+    factor_cols = factor_cols or get_default_factor_cols()
+
+    if winsorize:
+        panel = winsorize_by_date(panel, factor_cols)
+    if zscore:
+        panel = zscore_by_date(panel, factor_cols)
+        factor_cols = [f"{col}_z" for col in factor_cols]
+
+    return panel, factor_cols
