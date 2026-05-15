@@ -36,6 +36,8 @@ STANDARD_COLS = [
     "amount",
     "pct_change",
     "turnover",
+    "tradestatus",
+    "is_st",
 ]
 
 
@@ -249,13 +251,10 @@ def download_one_stock(
                 "amount": "amount",
                 "pctChg": "pct_change",
                 "turn": "turnover",
+                "isST": "is_st",
             }
 
             df = df.rename(columns=rename_dict)
-
-            # Keep only normal trading days if tradestatus is available.
-            if "tradestatus" in df.columns:
-                df = df[df["tradestatus"] == "1"].copy()
 
             df["ticker"] = df["ticker"].map(baostock_code_to_ticker)
 

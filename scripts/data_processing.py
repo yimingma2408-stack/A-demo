@@ -24,6 +24,17 @@ STANDARD_COLS = [
     "turnover",
 ]
 
+OPTIONAL_COLS = [
+    "tradestatus",
+    "is_st",
+    "isst",
+    "industry",
+    "market_cap",
+    "float_market_cap",
+    "index_start_date",
+    "index_end_date",
+]
+
 
 def load_panel(path: str | Path = RAW_PANEL_PATH) -> pd.DataFrame:
     """Load a raw daily stock panel and normalize basic dtypes."""
@@ -50,14 +61,22 @@ def standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    df = df[STANDARD_COLS].copy()
+    keep_cols = STANDARD_COLS + [col for col in OPTIONAL_COLS if col in df.columns]
+    df = df[keep_cols].copy()
     df["date"] = pd.to_datetime(df["date"])
     df["ticker"] = df["ticker"].astype(str).str.extract(r"(\d{6})", expand=False)
     df["ticker"] = df["ticker"].str.zfill(6)
 
-    numeric_cols = [col for col in STANDARD_COLS if col not in {"date", "ticker"}]
+    numeric_cols = [col for col in keep_cols if col not in {"date", "ticker", "industry"}]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "isst" in df.columns and "is_st" not in df.columns:
+        df = df.rename(columns={"isst": "is_st"})
+
+    for col in ["index_start_date", "index_end_date"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
 
     df = df.dropna(subset=["date", "ticker", "close"])
     df = df.drop_duplicates(["ticker", "date"], keep="last")
@@ -95,6 +114,92 @@ def clean_daily_panel(
 
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
     return df
+
+
+def add_trading_constraints(
+    df: pd.DataFrame,
+    st_limit: float = 0.05,
+    main_board_limit: float = 0.10,
+    growth_board_limit: float = 0.20,
+    limit_tolerance: float = 0.002,
+) -> pd.DataFrame:
+    """Infer tradability, ST, suspension, and limit-up/down flags.
+
+    The function uses explicit ``tradestatus``/``is_st`` columns when present.
+    If older data does not contain them, it falls back to volume and return
+    based inference so the rest of the research workflow still runs.
+    """
+    out = standardize_schema(df).sort_values(["ticker", "date"]).copy()
+
+    out["prev_close"] = out.groupby("ticker")["close"].shift(1)
+    if "ret_1d" not in out.columns:
+        out["ret_1d"] = out.groupby("ticker")["close"].pct_change()
+
+    if "is_st" in out.columns:
+        out["is_st_flag"] = out["is_st"].fillna(0).astype(float).astype(bool)
+    else:
+        out["is_st_flag"] = False
+
+    if "tradestatus" in out.columns:
+        out["is_suspended"] = out["tradestatus"].fillna(1).astype(float) != 1
+    else:
+        out["is_suspended"] = (out["volume"].fillna(0) <= 0) | (out["amount"].fillna(0) <= 0)
+
+    tickers = out["ticker"].astype(str)
+    is_growth_board = tickers.str.startswith(("300", "301", "688"))
+    out["limit_threshold"] = np.select(
+        [out["is_st_flag"], is_growth_board],
+        [st_limit, growth_board_limit],
+        default=main_board_limit,
+    )
+
+    pct_ret = out["pct_change"] / 100.0
+    out["is_limit_up"] = pct_ret >= (out["limit_threshold"] - limit_tolerance)
+    out["is_limit_down"] = pct_ret <= (-out["limit_threshold"] + limit_tolerance)
+    out["is_tradable"] = ~(out["is_suspended"] | out["is_st_flag"])
+    out["can_buy"] = out["is_tradable"] & ~out["is_limit_up"]
+    out["can_sell"] = out["is_tradable"] & ~out["is_limit_down"]
+    return out.reset_index(drop=True)
+
+
+def apply_point_in_time_universe(
+    df: pd.DataFrame,
+    membership: pd.DataFrame | None = None,
+    start_col: str = "index_start_date",
+    end_col: str = "index_end_date",
+) -> pd.DataFrame:
+    """Filter rows to stocks that were in the universe on each date.
+
+    ``membership`` can contain ticker plus start/end dates. If omitted, the
+    function looks for the same columns in ``df``. Missing end dates mean the
+    constituent is still active.
+    """
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"])
+
+    if membership is None:
+        if start_col not in out.columns:
+            return out
+        membership_cols = ["ticker", start_col]
+        if end_col in out.columns:
+            membership_cols.append(end_col)
+        membership = out[membership_cols].drop_duplicates()
+    else:
+        membership = membership.copy()
+
+    membership["ticker"] = membership["ticker"].astype(str).str.extract(r"(\d{6})", expand=False).str.zfill(6)
+    membership[start_col] = pd.to_datetime(membership[start_col], errors="coerce")
+    if end_col in membership.columns:
+        membership[end_col] = pd.to_datetime(membership[end_col], errors="coerce")
+    else:
+        membership[end_col] = pd.NaT
+
+    merged = out.merge(membership[["ticker", start_col, end_col]], on="ticker", how="left", suffixes=("", "_member"))
+    in_universe = merged[start_col].isna() | (
+        (merged["date"] >= merged[start_col])
+        & (merged[end_col].isna() | (merged["date"] <= merged[end_col]))
+    )
+    return merged.loc[in_universe, out.columns].reset_index(drop=True)
 
 
 def save_clean_data(

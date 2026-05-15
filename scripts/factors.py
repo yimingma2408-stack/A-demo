@@ -267,10 +267,74 @@ def zscore_by_date(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
+def neutralize_factors_by_date(
+    df: pd.DataFrame,
+    cols: list[str],
+    industry_col: str = "industry",
+    size_col: str = "float_market_cap",
+    min_obs: int = 20,
+) -> pd.DataFrame:
+    """Neutralize factors against industry dummies and log market cap by date.
+
+    If industry or market-cap columns are unavailable, the function uses the
+    controls that exist. With no usable controls it returns the input unchanged.
+    """
+    control_cols = []
+    if industry_col in df.columns:
+        control_cols.append(industry_col)
+    elif "industry" in df.columns:
+        industry_col = "industry"
+        control_cols.append(industry_col)
+
+    if size_col not in df.columns and "market_cap" in df.columns:
+        size_col = "market_cap"
+    if size_col in df.columns:
+        control_cols.append(size_col)
+
+    if not control_cols:
+        return df
+
+    out = df.copy()
+    for date, idx in out.groupby("date").groups.items():
+        group = out.loc[idx]
+        controls = pd.DataFrame(index=group.index)
+
+        if industry_col in group.columns:
+            dummies = pd.get_dummies(group[industry_col].fillna("unknown"), prefix="ind", dtype=float)
+            if len(dummies.columns) > 1:
+                controls = controls.join(dummies.iloc[:, 1:])
+
+        if size_col in group.columns:
+            size = pd.to_numeric(group[size_col], errors="coerce")
+            controls["log_size"] = np.log(size.where(size > 0))
+
+        controls = controls.replace([np.inf, -np.inf], np.nan)
+        if controls.empty:
+            continue
+
+        for col in cols:
+            y = pd.to_numeric(group[col], errors="coerce")
+            data = controls.copy()
+            data["_y"] = y
+            data = data.dropna()
+            if len(data) < max(min_obs, len(controls.columns) + 2):
+                continue
+
+            x = np.column_stack([np.ones(len(data)), data[controls.columns].to_numpy(dtype=float)])
+            beta = np.linalg.lstsq(x, data["_y"].to_numpy(dtype=float), rcond=None)[0]
+            fitted = x @ beta
+            out.loc[data.index, col] = data["_y"] - fitted
+
+    return out
+
+
 def build_factor_panel(
     df: pd.DataFrame,
     factor_cols: list[str] | None = None,
     winsorize: bool = True,
+    neutralize: bool = False,
+    industry_col: str = "industry",
+    size_col: str = "float_market_cap",
     zscore: bool = True,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Create factors, optional winsorization, and z-scored model inputs."""
@@ -279,6 +343,13 @@ def build_factor_panel(
 
     if winsorize:
         panel = winsorize_by_date(panel, factor_cols)
+    if neutralize:
+        panel = neutralize_factors_by_date(
+            panel,
+            factor_cols,
+            industry_col=industry_col,
+            size_col=size_col,
+        )
     if zscore:
         panel = zscore_by_date(panel, factor_cols)
         factor_cols = [f"{col}_z" for col in factor_cols]
